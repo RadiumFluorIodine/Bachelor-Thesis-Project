@@ -1,248 +1,500 @@
 """
-Fine-tuning (Transfer Learning) U-TAE Model for Kalimantan Selatan.
+Main Training Loop
+
+Main Features:
+1. Complete training pipeline
+2. Validation during training
+3. Logging & progress tracking
+4. Checkpoint saving & Resume Capability
+5. Early stopping
+6. GPU/CPU compatibility
+7. Automatic Plotting (Learning Curve Only)
+8. Comprehensive Metrics Tracking (Loss, MAE, RMSE, R2 for Train & Val)
+9. Fixed batch_positions dimension bug
+10. ASCII/UTF-8 Safe (No Emojis)
+
+Expected Usage:
+    python train_utae.py --config config.yaml
+    python train_utae.py --resume  # Untuk melanjutkan training yang terhenti
 """
-import os
-import sys
+
 import torch
 import torch.nn as nn
-import numpy as np
-import json
-import matplotlib.pyplot as plt
-from pathlib import Path
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
 from tqdm import tqdm
+import argparse
+import json
+from typing import Dict, Tuple, Optional
+import sys
+import os
 
 # Setup Path
 current_path = os.path.abspath(__file__)
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_path)))
+
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from src.models.utae import UTAE
 from src.data.dataset import BiomassDataset, collate_fn_biomass, get_or_create_global_split
-from src.training.training_utils import BiomassRegressionLoss, RegressionMetrics
+from src.models.utae import UTAE
+from src.training.training_utils import (
+    BiomassRegressionLoss,
+    RegressionMetrics,
+    WarmupScheduler,
+    EarlyStopping,
+    CheckpointManager,
+    TrainingState,
+    setup_logging
+)
 
-def plot_finetune_results(history: dict, best_preds: np.ndarray, best_labels: np.ndarray, output_dir: str):
-    """Membuat 3 grafik untuk laporan skripsi (Loss Curve, R2 Curve, Scatter Plot)."""
-    print("\n🎨 Membuat grafik hasil Fine-Tuning untuk laporan skripsi...")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    epochs_range = range(1, len(history['train_loss']) + 1)
+class UTAETrainer:
+    """
+    Complete trainer untuk U-TAE model.
+    """
     
-    # Plot 1: Learning Curve (Loss)
-    axes[0].plot(epochs_range, history['train_loss'], 'b-', label='Train Loss (MSE)')
-    axes[0].plot(epochs_range, history['val_loss'], 'r-', label='Val Loss (MSE)')
-    axes[0].set_title('Learning Curve (Fine-Tuning Kalsel)', fontweight='bold')
-    axes[0].set_xlabel('Epoch', fontweight='bold')
-    axes[0].set_ylabel('Loss', fontweight='bold')
-    axes[0].legend()
-    axes[0].grid(True, linestyle='--', alpha=0.7)
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: torch.device,
+        config: Dict,
+        save_dirs: Dict
+    ):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        self.config = config
+        self.save_dirs = save_dirs
+        
+        # Setup logging
+        self.logger = setup_logging(
+            log_dir=save_dirs['logs'],
+            experiment_name=config.get('experiment_name', 'utae_training_no_cliping')
+        )
+        self.writer = SummaryWriter(log_dir=save_dirs['runs'])
+
+        # Setup optimizer
+        self.optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config.get('weight_decay', 1e-4)
+        )
+        
+        # Setup loss function
+        self.loss_fn = BiomassRegressionLoss(
+            smoothness_weight=config.get('smoothness_weight', 0.1)
+        )
+        
+        # Setup learning rate scheduler
+        num_epochs = config['num_epochs']
+        num_batches = len(train_loader)
+        total_steps = num_epochs * num_batches
+        num_warmup_steps = int(0.1 * total_steps)  # 10% warmup
+        
+        self.scheduler = WarmupScheduler(
+            optimizer=self.optimizer,
+            peak_lr=config['learning_rate'],
+            num_warmup_steps=num_warmup_steps,
+            total_steps=total_steps
+        )
+        
+        # Setup early stopping
+        self.early_stopping = EarlyStopping(
+            patience=config.get('early_stopping_patience', 10),
+            min_delta=1e-4,
+            mode='min'
+        )
+        
+        # Setup checkpoint manager
+        self.checkpoint_manager = CheckpointManager(
+            checkpoint_dir=save_dirs['checkpoints'],
+            keep_best_k=3
+        )
+        
+        # Setup training state
+        self.train_state = TrainingState(save_dir=save_dirs['logs'])
+        
+        # Training Tracking (History for Plotting & Logging)
+        self.history = {
+            'train_loss': [], 'train_mae': [], 'train_rmse': [], 'train_r2': [],
+            'val_loss': [], 'val_mae': [], 'val_rmse': [], 'val_r2': []
+        }
+        self.start_epoch = 0
+        self.best_val_mae = float('inf')
+        self.best_preds_raw = None
+        self.best_labels_raw = None
+
+        # Resume Mechanism
+        self.resume_checkpoint_path = os.path.join(save_dirs['checkpoints'], "resume_checkpoint.pt")
+        if config.get('resume', False) and os.path.exists(self.resume_checkpoint_path):
+            self._load_resume_checkpoint()
+
+        # Log configuration
+        self.logger.info("=" * 70)
+        self.logger.info("TRAINING CONFIGURATION")
+        self.logger.info("=" * 70)
+        for key, value in config.items():
+            self.logger.info(f"{key}: {value}")
+        self.logger.info("=" * 70)
+
+    def _load_resume_checkpoint(self):
+        """Memuat checkpoint untuk melanjutkan training."""
+        self.logger.info("[RESUME] Menemukan checkpoint! Melanjutkan proses training yang tertunda...")
+        checkpoint = torch.load(self.resume_checkpoint_path, map_location=self.device, weights_only=False)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_val_mae = checkpoint.get('best_val_mae', float('inf'))
+        
+        # Update history if exists, ensuring backward compatibility
+        loaded_history = checkpoint.get('history', {})
+        for k in self.history.keys():
+            self.history[k] = loaded_history.get(k, [])
+        
+        if hasattr(self.early_stopping, 'best'):
+            self.early_stopping.best = checkpoint.get('best_val_loss_es', float('inf'))
+        
+        self.logger.info(f"[RESUME] Melanjutkan dari Epoch {self.start_epoch+1}. Best Val MAE sebelumnya: {self.best_val_mae:.4f}")
+
+    def plot_training_results(self):
+        """Membuat grafik Learning Curve (Train Loss & Val Loss)."""
+        if not self.history['train_loss']:
+            return
+
+        self.logger.info("Membuat grafik Learning Curve...")
+        plt.figure(figsize=(8, 6))
+        epochs_range = range(1, len(self.history['train_loss']) + 1)
+        
+        # Plot Learning Curve
+        plt.plot(epochs_range, self.history['train_loss'], 'b-', linewidth=2, label='Train Loss')
+        plt.plot(epochs_range, self.history['val_loss'], 'r-', linewidth=2, label='Val Loss')
+        plt.title('Learning Curve', fontweight='bold', fontsize=14)
+        plt.xlabel('Epoch', fontweight='bold', fontsize=12)
+        plt.ylabel('Loss', fontweight='bold', fontsize=12)
+        plt.legend(fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        plot_path = Path(self.save_dirs['logs']) / 'learning_curve.png'
+        plt.savefig(plot_path, dpi=300)
+        plt.close() # Menutup figure agar tidak memenuhi memory
+        self.logger.info(f"Grafik tersimpan di: {plot_path}")
+
+    def train_epoch(self, epoch_idx) -> Dict[str, float]:
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+        all_preds, all_targets = [], []
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch [{epoch_idx+1:03d}] Train", leave=False, ncols=100, file=sys.stdout)
+        
+        for batch in pbar:
+            images = batch['image'].to(self.device)
+            labels = batch['label'].to(self.device)
+            batch_positions = batch['batch_positions'].to(self.device)
+            
+            # --- Perbaikan Bug Dimensi ---
+            if batch_positions.dim() == 1:
+                batch_positions = batch_positions.unsqueeze(0).expand(images.size(0), -1)
+            # -----------------------------
+
+            valid_mask = batch.get('valid_mask', None)
+            
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(self.device)
+                if valid_mask.dim() == 3: valid_mask = valid_mask.unsqueeze(1)
+            
+            if labels.dim() == 3: labels = labels.unsqueeze(1)
+            
+            self.optimizer.zero_grad()
+            output = self.model(images, batch_positions=batch_positions)
+
+            pred = output['agb'] if isinstance(output, dict) else output
+            
+            loss = self.loss_fn(pred, labels, valid_mask)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.config.get('grad_clip_norm', 1.0)
+            )
+            
+            self.optimizer.step()
+            self.scheduler.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            if valid_mask is not None:
+                mask_np = valid_mask.bool().cpu().numpy()
+                all_preds.append(pred.detach().cpu().numpy()[mask_np])
+                all_targets.append(labels.cpu().numpy()[mask_np])
+            else:
+                all_preds.append(pred.detach().cpu().numpy().flatten())
+                all_targets.append(labels.cpu().numpy().flatten())
+            
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{self.scheduler.get_lr():.6f}"})
+        
+        all_preds = np.concatenate(all_preds)
+        all_targets = np.concatenate(all_targets)
+        avg_loss = total_loss / max(num_batches, 1)
+        
+        metrics = RegressionMetrics.compute_all(all_preds, all_targets)
+        self.train_state.update_train(avg_loss, **metrics)
+        metrics['loss'] = avg_loss
+
+        self.writer.add_scalar('Loss/train', avg_loss, epoch_idx)
+        self.writer.add_scalar('MAE/train', metrics['mae'], epoch_idx)
+        self.writer.add_scalar('RMSE/train', metrics['rmse'], epoch_idx)
+        self.writer.add_scalar('R2/train', metrics['r2'], epoch_idx)
+        self.writer.add_scalar('LR', self.scheduler.get_lr(), epoch_idx)
+        
+        return metrics
     
-    # Plot 2: R-Squared Progression
-    axes[1].plot(epochs_range, history['val_r2'], 'g-', linewidth=2, label='Validation R²')
-    axes[1].axhline(y=0, color='r', linestyle='--', alpha=0.5)
-    axes[1].set_title('Perkembangan Akurasi (R²)', fontweight='bold')
-    axes[1].set_xlabel('Epoch', fontweight='bold')
-    axes[1].set_ylabel('R-Squared', fontweight='bold')
-    axes[1].legend()
-    axes[1].grid(True, linestyle='--', alpha=0.7)
+    @torch.no_grad()
+    def validate(self, epoch_idx) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        all_preds, all_targets = [], []
+        
+        pbar = tqdm(self.val_loader, desc=f"Epoch [{epoch_idx+1:03d}] Val", leave=False, ncols=100, file=sys.stdout)
+        
+        for batch in pbar:
+            images = batch['image'].to(self.device)
+            labels = batch['label'].to(self.device)
+            batch_positions = batch['batch_positions'].to(self.device)
+            
+            # --- Perbaikan Bug Dimensi ---
+            if batch_positions.dim() == 1:
+                batch_positions = batch_positions.unsqueeze(0).expand(images.size(0), -1)
+            # -----------------------------
+            
+            valid_mask = batch.get('valid_mask', None)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(self.device)
+                if valid_mask.dim() == 3: valid_mask = valid_mask.unsqueeze(1)
+            
+            if labels.dim() == 3: labels = labels.unsqueeze(1)
+            
+            output = self.model(images, batch_positions=batch_positions)
+            pred = output['agb'] if isinstance(output, dict) else output
+
+            # Compute internal validation loss for history
+            loss = self.loss_fn(pred, labels, valid_mask)
+            total_loss += loss.item()
+            num_batches += 1
+            
+            if valid_mask is not None:
+                mask_np = valid_mask.bool().cpu().numpy()
+                all_preds.append(pred.cpu().numpy()[mask_np])
+                all_targets.append(labels.cpu().numpy()[mask_np])
+            else:
+                all_preds.append(pred.cpu().numpy().flatten())
+                all_targets.append(labels.cpu().numpy().flatten())
+        
+        all_preds = np.concatenate(all_preds)
+        all_targets = np.concatenate(all_targets)
+        avg_loss = total_loss / max(num_batches, 1)
+        
+        metrics = RegressionMetrics.compute_all(all_preds, all_targets)
+        metrics['loss'] = avg_loss
+        self.train_state.update_val(**metrics)
+
+        self.writer.add_scalar('Loss/val', avg_loss, epoch_idx)
+        self.writer.add_scalar('MAE/val', metrics['mae'], epoch_idx)
+        self.writer.add_scalar('RMSE/val', metrics['rmse'], epoch_idx)
+        self.writer.add_scalar('R2/val', metrics['r2'], epoch_idx)
+        
+        return metrics, all_preds, all_targets
     
-    # Plot 3: Scatter Plot 1:1 (Best Epoch)
-    axes[2].scatter(best_labels, best_preds, alpha=0.5, color='forestgreen', s=10)
-    max_val = max(best_labels.max(), best_preds.max())
-    axes[2].plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='1:1 Ideal')
-    
-    if len(best_labels) > 1:
-        z = np.polyfit(best_labels, best_preds, 1)
-        p = np.poly1d(z)
-        axes[2].plot([0, max_val], p([0, max_val]), 'b-', linewidth=2, label='Regresi Model')
-    
-    axes[2].set_title('Prediksi vs Aktual (Model Terbaik)', fontweight='bold')
-    axes[2].set_xlabel('Aktual AGB (Mg/ha)', fontweight='bold')
-    axes[2].set_ylabel('Prediksi AGB (Mg/ha)', fontweight='bold')
-    axes[2].legend()
-    axes[2].grid(True, linestyle='--', alpha=0.7)
-    
-    plt.tight_layout()
-    plot_path = Path(output_dir) / 'finetune_kalsel_plots.png'
-    plt.savefig(plot_path, dpi=300)
-    print(f"✅ Grafik tersimpan di: {plot_path}")
+    def fit(self):
+        num_epochs = self.config['num_epochs']
+        
+        for epoch in range(self.start_epoch, num_epochs):
+            # Training epoch
+            train_metrics = self.train_epoch(epoch)
+            
+            # Validation epoch
+            val_metrics, val_preds, val_targets = self.validate(epoch)
+            
+            # Update history with all metrics
+            self.history['train_loss'].append(train_metrics['loss'])
+            self.history['train_mae'].append(train_metrics['mae'])
+            self.history['train_rmse'].append(train_metrics['rmse'])
+            self.history['train_r2'].append(train_metrics['r2'])
+            
+            self.history['val_loss'].append(val_metrics['loss'])
+            self.history['val_mae'].append(val_metrics['mae'])
+            self.history['val_rmse'].append(val_metrics['rmse'])
+            self.history['val_r2'].append(val_metrics['r2'])
+
+            # Print ke terminal per epoch (Aman dari Emoji dan karakter khusus)
+            self.logger.info(
+                f"Epoch [{epoch+1:03d}/{num_epochs}] -> "
+                f"Train [Loss: {train_metrics['loss']:.4f} | MAE: {train_metrics['mae']:.4f} | RMSE: {train_metrics['rmse']:.4f} | R2: {train_metrics['r2']:.4f}] || "
+                f"Val [Loss: {val_metrics['loss']:.4f} | MAE: {val_metrics['mae']:.4f} | RMSE: {val_metrics['rmse']:.4f} | R2: {val_metrics['r2']:.4f}]"
+            )
+            
+            # Save checkpoint if best model
+            is_best = val_metrics['mae'] < self.best_val_mae
+            if is_best:
+                self.best_val_mae = val_metrics['mae']
+                self.best_preds_raw = val_preds
+                self.best_labels_raw = val_targets
+                self.logger.info(f"New best model found! (MAE: {self.best_val_mae:.4f})")
+            
+            self.checkpoint_manager.save(
+                model=self.model,
+                optimizer=self.optimizer,
+                epoch=epoch,
+                metric_value=val_metrics['mae'],
+                is_best=is_best,
+                metadata=self.config
+            )
+
+            # Simpan Resume Checkpoint setiap epoch
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'best_val_mae': self.best_val_mae,
+                'best_val_loss_es': self.early_stopping.best if hasattr(self.early_stopping, 'best') else float('inf'),
+                'history': self.history
+            }, self.resume_checkpoint_path)
+            
+            # Check early stopping
+            if self.early_stopping(val_metrics['mae']):
+                self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                break
+        
+        # Save training history and Plot Results
+        history_path = self.train_state.save_history()
+        self.plot_training_results()
+        
+        self.writer.close()
+        self.logger.info(f"History saved to {history_path}")
+        self.logger.info("TRAINING COMPLETED")
+
+def get_default_config() -> Dict:
+    return {
+        'input_dim': 10,
+        'output_dim': 1,
+        'encoder_widths': [64, 64, 64, 128],
+        'decoder_widths': [32, 32, 64, 128],
+        'd_model': 256,
+        'n_head': 16,
+        'd_k': 4,
+        'encoder_norm': 'group',
+        'num_epochs': 300,
+        'batch_size': 8,
+        'learning_rate': 1e-3,
+        'weight_decay': 1e-4,
+        'grad_clip_norm': 1.0,
+        'smoothness_weight': 0.1,
+        'early_stopping_patience': 10,
+        'data_dirc': 'data/processed/lampung/no_cliping',
+        'split_dirc': 'data/processed/lampung/splits',
+        'num_workers': 10,
+        'experiment_name': 'U-TAE_No-Cliping',
+        'seed': 42,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'resume': False  # Setting default resume
+    }
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Memulai Fine-Tuning di perangkat: {device}")
+    parser = argparse.ArgumentParser(description='Train U-TAE model No Cliping')
+    parser.add_argument('--config', type=str, default=None, help='Path to config JSON file')
+    parser.add_argument('--num_epochs', type=int, default=None, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=None, help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
+    parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
+    args = parser.parse_args()
+    
+    config = get_default_config()
+    
+    if args.config:
+        with open(args.config) as f:
+            config.update(json.load(f))
+    
+    if args.num_epochs: config['num_epochs'] = args.num_epochs
+    if args.batch_size: config['batch_size'] = args.batch_size
+    if args.lr: config['learning_rate'] = args.lr
+    if args.resume: config['resume'] = True
+    
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+    device = torch.device(config['device'])
+    print(f"Using device: {device}")
+    
+    results_dir = os.path.join(root_dir, 'src', 'results') 
+    save_dirs = {
+        'logs': os.path.join(results_dir, 'logs', config['experiment_name']),
+        'checkpoints': os.path.join(results_dir, 'checkpoints', config['experiment_name']),
+        'runs': os.path.join(results_dir, 'runs', config['experiment_name'])
+    }
+    for d in save_dirs.values():
+        os.makedirs(d, exist_ok=True)
+    
+    print("Loading dataset and splitting...")
+    train_files, val_files = get_or_create_global_split(
+        data_dir=config['data_dirc'], split_dir=config['split_dirc'], test_size=0.2, random_state=config['seed']
+    )
+    
+    train_dataset = BiomassDataset(root_dir=config['data_dirc'], mode='train', file_list=train_files)
+    val_dataset = BiomassDataset(root_dir=config['data_dirc'], mode='val', file_list=val_files)
 
-    # --- KONFIGURASI PATH ---
-    pretrained_model_path = "src/results/checkpoints/U-TAE/best_model.pt"
-    config_path = "src/results/checkpoints/U-TAE/config.json"
-    kalsel_data_dir = "data/processed/kalsel"
-    kalsel_norm_path = "data/processed/kalsel/normalization.json"
-    kalsel_split_dir = "data/processed/kalsel/splits"
-    output_dir = "src/results/checkpoints/U-TAE_Finetuned_Kalsel"
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Load Normalization Stats Kalsel (untuk denormalisasi metrik)
-    with open(kalsel_norm_path) as f:
-        norm_stats = json.load(f)
-    agb_log_mean = norm_stats.get('agb_log_mean', 4.145451)
-    agb_log_std = norm_stats.get('agb_log_std', 1.157854)
-
-    # 1. LOAD PRE-TRAINED MODEL (MODEL LAMPUNG)
-    with open(config_path) as f:
-        config = json.load(f)
-
+    train_loader = DataLoader(
+        train_dataset, batch_size=config['batch_size'], shuffle=True,
+        collate_fn=collate_fn_biomass, num_workers=config['num_workers'],
+        pin_memory=True, persistent_workers=True if config['num_workers'] > 0 else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, batch_size=config['batch_size'], shuffle=False,
+        collate_fn=collate_fn_biomass, num_workers=config['num_workers'],
+        pin_memory=True, persistent_workers=True if config['num_workers'] > 0 else False
+    )
+    
+    print(f"Training set: {len(train_dataset)} samples")
+    print(f"Validation set: {len(val_dataset)} samples")
+    
+    print("Creating model...")
     model = UTAE(
         input_dim=config['input_dim'], output_dim=config['output_dim'],
         encoder_widths=config['encoder_widths'], decoder_widths=config['decoder_widths'],
-        d_model=config['d_model'], n_head=config['n_head']
-    ).to(device)
-    
-    checkpoint = torch.load(pretrained_model_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
-    print("✅ Pre-trained model (Lampung) berhasil dimuat.")
-
-    # 2. LOAD DATASET KALIMANTAN SELATAN (GLOBAL SPLIT)
-    print("\n📦 Menyiapkan Global Split untuk Kalsel...")
-    train_files, val_files = get_or_create_global_split(
-        data_dir=kalsel_data_dir, 
-        split_dir=kalsel_split_dir, 
-        test_size=0.2, 
-        random_state=42
+        d_model=config['d_model'], n_head=config['n_head'], d_k=config['d_k']
     )
     
-    print(f"📊 Total Data Kalsel: {len(train_files) + len(val_files)} patches")
-    print(f"   -> Data Training   : {len(train_files)} patches")
-    print(f"   -> Data Validation : {len(val_files)} patches")
-
-    train_dataset = BiomassDataset(root_dir=kalsel_data_dir, mode='train', augment=True, file_list=train_files)
-    val_dataset = BiomassDataset(root_dir=kalsel_data_dir, mode='val', augment=False, file_list=val_files)
+    print("Starting training process...")
+    trainer = UTAETrainer(
+        model=model, train_loader=train_loader, val_loader=val_loader,
+        device=device, config=config, save_dirs=save_dirs
+    )
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn_biomass, num_workers=4, pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn_biomass, num_workers=4, pin_memory=True, persistent_workers=True)
-
-    # 3. SETUP TRAINING DENGAN EARLY STOPPING (FULL PRECISION FP32)
-    optimizer = AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
-    criterion = BiomassRegressionLoss(smoothness_weight=config.get('smoothness_weight', 0.1))
+    trainer.fit()
     
-    epochs = 100
-    patience = 10
-    patience_counter = 0
-    best_val_loss = float('inf')
+    print("\n" + "=" * 70)
+    print("FINAL EVALUATION ON VALIDATION SET (BEST MODEL)")
+    try:
+        trainer.checkpoint_manager.load_best(model)
+        print("Best model successfully loaded")
+        val_metrics, _, _ = trainer.validate(epoch_idx=-1)
+        print(f"Final Validation MAE: {val_metrics['mae']:.4f}")
+        print(f"Final Validation RMSE: {val_metrics['rmse']:.4f}")
+        print(f"Final Validation R2: {val_metrics['r2']:.4f}")
+    except Exception as e:
+        print(f"Error loading best model: {e}")
     
-    history = {'train_loss': [], 'val_loss': [], 'val_r2': [], 'val_mae': []}
-    best_preds_raw = None
-    best_labels_raw = None
+    print("=" * 70)
 
-    print("\n🔄 Memulai Proses Fine-Tuning (Transfer Learning)...")
-    for epoch in range(epochs):
-        # --- TRAINING PHASE ---
-        model.train()
-        train_loss = 0.0
-        
-        for batch in tqdm(train_loader, desc=f"Epoch [{epoch+1:03d}/{epochs}] Training"):
-            images = batch['image'].to(device)
-            labels = batch['label'].to(device)
-            pos = batch['batch_positions'].to(device)
-            
-            if pos.dim() == 1:
-                pos = pos.unsqueeze(0).expand(images.size(0), -1)
-            
-            optimizer.zero_grad()
-
-            # Forward pass dalam Full Precision (FP32)
-            preds = model(images, batch_positions=pos)['agb']
-            
-            if 'valid_mask' in batch:
-                mask = batch['valid_mask'].bool().to(device)
-                # Trik Masking: Ubah tebakan di area awan/laut sama dengan label agar error = 0
-                preds_loss = torch.where(mask, preds, labels)
-                loss = criterion(preds_loss, labels)
-            else:
-                loss = criterion(preds, labels)
-                
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-
-        # --- VALIDATION PHASE ---
-        model.eval()
-        val_loss = 0.0
-        all_preds, all_targets = [], []
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch [{epoch+1:03d}/{epochs}] Validation"):
-                images = batch['image'].to(device)
-                labels = batch['label'].to(device)
-                pos = batch['batch_positions'].to(device)
-                
-                if pos.dim() == 1:
-                    pos = pos.unsqueeze(0).expand(images.size(0), -1)
-                    
-                # Forward pass dalam Full Precision (FP32)
-                preds = model(images, batch_positions=pos)['agb']
-                
-                if 'valid_mask' in batch:
-                    mask = batch['valid_mask'].bool().to(device)
-                    preds_loss = torch.where(mask, preds, labels)
-                    loss = criterion(preds_loss, labels)
-                    
-                    # Flatten HANYA UNTUK HITUNG R2 dan MAE
-                    p = preds.view(-1)[mask.view(-1)]
-                    l = labels.view(-1)[mask.view(-1)]
-                else:
-                    loss = criterion(preds, labels)
-                    p = preds.flatten()
-                    l = labels.flatten()
-                    
-                val_loss += loss.item()
-                
-                # Denormalisasi untuk metrik
-                p_raw = torch.expm1((p * agb_log_std) + agb_log_mean).cpu().numpy()
-                l_raw = torch.expm1((l * agb_log_std) + agb_log_mean).cpu().numpy()
-                all_preds.append(np.clip(p_raw, 0, None))
-                all_targets.append(np.clip(l_raw, 0, None))
-
-        train_loss /= len(train_loader)
-        val_loss /= len(val_loader)
-        
-        predictions = np.concatenate(all_preds).flatten()
-        targets = np.concatenate(all_targets).flatten()
-        metrics = RegressionMetrics.compute_all(predictions, targets)
-
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_r2'].append(metrics['r2'])
-        history['val_mae'].append(metrics['mae'])
-        
-        print(f"--> Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val R²: {metrics['r2']:.4f} | Val MAE: {metrics['mae']:.2f}")
-
-        # --- EARLY STOPPING LOGIC ---
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0 
-            best_preds_raw = predictions
-            best_labels_raw = targets
-            
-            torch.save(model.state_dict(), f"{output_dir}/best_finetuned_model.pt")
-            
-            with open(f"{output_dir}/config.json", 'w') as f:
-                json.dump(config, f)
-                
-            print("   🌟 Model membaik! Bobot terbaik disimpan.")
-        else:
-            patience_counter += 1
-            print(f"   ⚠️ Val Loss tidak membaik. Early Stopping Counter: {patience_counter}/{patience}")
-            
-        if patience_counter >= patience:
-            print(f"\n🛑 EARLY STOPPING DIPICU! Model berhenti belajar karena Val Loss tidak membaik selama {patience} epoch berturut-turut.")
-            break
-
-    # Buat Plot
-    if best_preds_raw is not None:
-        plot_finetune_results(history, best_preds_raw, best_labels_raw, output_dir)
-        
-    print("\n✅ Fine-Tuning Selesai! Model siap digunakan untuk inferensi di Kalimantan Selatan.")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
